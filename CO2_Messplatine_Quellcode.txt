@@ -1,0 +1,993 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_CCS811.h>
+#include <SensirionI2cScd4x.h>
+#include <SparkFun_SCD30_Arduino_Library.h>
+#include <RTClib.h>
+#include <SD.h>
+
+// ============================================================
+// PINBELEGUNG
+// ============================================================
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define BUTTON_PIN 17
+
+#define SD_CS 5
+
+#define LED_YELLOW 4
+#define LED_RED    25
+
+#define LCD_ADDR 0x27
+
+
+// ============================================================
+// KALIBRIERUNG
+// ============================================================
+
+#define CALIBRATION_PPM 400
+
+
+// ============================================================
+// OBJEKTE
+// ============================================================
+
+LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
+
+Adafruit_CCS811 ccs811;
+SensirionI2cScd4x scd41;
+SCD30 scd30;
+
+RTC_DS3231 rtc;
+File logFile;
+
+
+// ============================================================
+// SENSORSTATUS
+// ============================================================
+
+bool ccs811Available = false;
+bool scd41Available = false;
+bool scd30Available = false;
+bool rtcAvailable = false;
+bool sdAvailable = false;
+
+
+// ============================================================
+// MESSWERTE
+// ============================================================
+
+uint16_t ccs_co2 = 0;
+
+uint16_t scd41_co2 = 0;
+float scd41_temp = 0.0;
+float scd41_hum = 0.0;
+
+uint16_t scd30_co2 = 0;
+float scd30_temp = 0.0;
+float scd30_hum = 0.0;
+
+
+// ============================================================
+// ZEITSTEUERUNG
+// ============================================================
+
+unsigned long lastMeasurement = 0;
+const unsigned long measurementInterval = 5000;
+
+
+// ============================================================
+// TASTER / ENTPRELLUNG
+// ============================================================
+
+bool lastRawButtonState = HIGH;
+bool stableButtonState = HIGH;
+
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+
+// ============================================================
+// LCD-PFEILE
+// ============================================================
+
+byte arrowUp[8] = {
+  0b00100,
+  0b01110,
+  0b10101,
+  0b00100,
+  0b00100,
+  0b00100,
+  0b00100,
+  0b00100
+};
+
+byte arrowDown[8] = {
+  0b00100,
+  0b00100,
+  0b00100,
+  0b00100,
+  0b10101,
+  0b01110,
+  0b00100,
+  0b00000
+};
+
+
+// ============================================================
+// SCD41 ROBUST STARTEN
+// ============================================================
+
+bool startSCD41() {
+
+  Serial.println();
+  Serial.println("SCD41 Initialisierung...");
+
+  scd41.begin(Wire, 0x62);
+
+  // Sensor nach Power-Up Zeit geben
+  delay(1000);
+
+  // Eventuell laufenden Messbetrieb stoppen
+  Serial.println(
+    "SCD41: Messbetrieb wird zurueckgesetzt..."
+  );
+
+  int16_t stopError =
+      scd41.stopPeriodicMeasurement();
+
+  Serial.print("SCD41 Stop-Code: ");
+  Serial.println(stopError);
+
+  // Mindestens 500 ms warten
+  delay(600);
+
+  // Periodische Messung neu starten
+  for (int attempt = 1; attempt <= 3; attempt++) {
+
+    Serial.print("SCD41 Startversuch ");
+    Serial.print(attempt);
+    Serial.print("/3: ");
+
+    int16_t startError =
+        scd41.startPeriodicMeasurement();
+
+    if (startError == 0) {
+
+      Serial.println("OK");
+      Serial.println(
+        "SCD41 erfolgreich gestartet."
+      );
+
+      return true;
+    }
+
+    Serial.print("FEHLER ");
+    Serial.println(startError);
+
+    delay(1000);
+  }
+
+  Serial.println(
+    "SCD41 konnte nicht gestartet werden!"
+  );
+
+  return false;
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("CO2-MESSSYSTEM STARTET");
+  Serial.println("================================");
+
+
+  // ----------------------------------------------------------
+  // I2C
+  // ----------------------------------------------------------
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // Langsame und stabile I2C-Geschwindigkeit
+  Wire.setClock(100000);
+
+
+  // ----------------------------------------------------------
+  // Taster
+  // ----------------------------------------------------------
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+
+  // ----------------------------------------------------------
+  // LED
+  // ----------------------------------------------------------
+
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW);
+
+
+  // ----------------------------------------------------------
+  // LCD
+  // ----------------------------------------------------------
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.createChar(0, arrowUp);
+  lcd.createChar(1, arrowDown);
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("System startet");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Bitte warten");
+
+
+  // ==========================================================
+  // SCD41
+  // ==========================================================
+
+  scd41Available = startSCD41();
+
+
+  // ==========================================================
+  // SCD30
+  // ==========================================================
+
+  if (scd30.begin(Wire)) {
+
+    scd30Available = true;
+
+    Serial.println("SCD30: OK");
+
+  } else {
+
+    scd30Available = false;
+
+    Serial.println("SCD30: NICHT GEFUNDEN");
+  }
+
+
+  // ==========================================================
+  // CCS811
+  // ==========================================================
+
+  if (ccs811.begin()) {
+
+    ccs811Available = true;
+
+    Serial.println("CCS811: OK");
+
+  } else {
+
+    ccs811Available = false;
+
+    Serial.println("CCS811: NICHT GEFUNDEN");
+  }
+
+
+  // ==========================================================
+  // RTC
+  // ==========================================================
+
+  if (rtc.begin()) {
+
+    rtcAvailable = true;
+
+    Serial.println("RTC: OK");
+
+    if (rtc.lostPower()) {
+
+      Serial.println(
+        "RTC: Zeit wird gesetzt"
+      );
+
+      rtc.adjust(
+        DateTime(
+          F(__DATE__),
+          F(__TIME__)
+        )
+      );
+    }
+
+  } else {
+
+    rtcAvailable = false;
+
+    Serial.println("RTC: NICHT GEFUNDEN");
+  }
+
+
+  // ==========================================================
+  // SD-KARTE
+  // ==========================================================
+
+  if (SD.begin(SD_CS)) {
+
+    sdAvailable = true;
+
+    Serial.println("SD-Karte: OK");
+
+    if (!SD.exists("/co2_log.csv")) {
+
+      logFile =
+          SD.open(
+            "/co2_log.csv",
+            FILE_WRITE
+          );
+
+      if (logFile) {
+
+        logFile.println(
+          "Datum,Uhrzeit,Temperatur_C,"
+          "CCS811_eCO2,SCD41_CO2,SCD30_CO2"
+        );
+
+        logFile.close();
+      }
+    }
+
+  } else {
+
+    sdAvailable = false;
+
+    Serial.println(
+      "SD-Karte: NICHT GEFUNDEN"
+    );
+  }
+
+
+  // ==========================================================
+  // SYSTEMSTATUS
+  // ==========================================================
+
+  Serial.println();
+  Serial.println("================================");
+
+  Serial.print("SCD41 : ");
+  Serial.println(
+    scd41Available ? "OK" : "FEHLER"
+  );
+
+  Serial.print("SCD30 : ");
+  Serial.println(
+    scd30Available ? "OK" : "FEHLER"
+  );
+
+  Serial.print("CCS811: ");
+  Serial.println(
+    ccs811Available ? "OK" : "FEHLER"
+  );
+
+  Serial.print("RTC   : ");
+  Serial.println(
+    rtcAvailable ? "OK" : "FEHLER"
+  );
+
+  Serial.print("SD    : ");
+  Serial.println(
+    sdAvailable ? "OK" : "FEHLER"
+  );
+
+  Serial.println("================================");
+  Serial.println("Kalibrierung: 400 ppm");
+  Serial.println("================================");
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("System bereit");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Taste=Kalib.");
+
+  delay(2000);
+
+  lastMeasurement = millis();
+}
+
+
+// ============================================================
+// TASTER
+// ============================================================
+
+void checkButton() {
+
+  bool rawState =
+      digitalRead(BUTTON_PIN);
+
+  if (rawState != lastRawButtonState) {
+
+    lastDebounceTime = millis();
+
+    lastRawButtonState = rawState;
+  }
+
+  if ((millis() - lastDebounceTime)
+      >= debounceDelay) {
+
+    if (rawState != stableButtonState) {
+
+      stableButtonState = rawState;
+
+      // Nur beim Druecken ausloesen
+      if (stableButtonState == LOW) {
+
+        Serial.println();
+        Serial.println("Taster gedrueckt");
+
+        calibrateSensors();
+      }
+    }
+  }
+}
+
+
+// ============================================================
+// KALIBRIERUNG
+// ============================================================
+
+void calibrateSensors() {
+
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW);
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Kalibrierung");
+
+  lcd.setCursor(0, 1);
+  lcd.print("auf 400 ppm");
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("KALIBRIERUNG GESTARTET");
+  Serial.println("Referenzwert: 400 ppm");
+  Serial.println("================================");
+
+  delay(1000);
+
+
+  // ==========================================================
+  // SCD30
+  // ==========================================================
+
+  bool scd30CalibrationOK = false;
+
+  if (scd30Available) {
+
+    scd30CalibrationOK =
+        scd30.setForcedRecalibrationFactor(
+          CALIBRATION_PPM
+        );
+
+    if (scd30CalibrationOK) {
+
+      Serial.println(
+        "SCD30: Kalibrierung erfolgreich"
+      );
+
+    } else {
+
+      Serial.println(
+        "SCD30: Kalibrierung FEHLER"
+      );
+    }
+
+  } else {
+
+    Serial.println(
+      "SCD30: nicht verfuegbar"
+    );
+  }
+
+
+  // ==========================================================
+  // SCD41
+  // ==========================================================
+
+  bool scd41CalibrationOK = false;
+
+  if (scd41Available) {
+
+    Serial.println(
+      "SCD41: Messung wird gestoppt..."
+    );
+
+    int16_t stopError =
+        scd41.stopPeriodicMeasurement();
+
+    delay(600);
+
+    uint16_t frcCorrection = 0xFFFF;
+
+    int16_t frcError = -1;
+
+    if (stopError == 0) {
+
+      frcError =
+          scd41.performForcedRecalibration(
+            CALIBRATION_PPM,
+            frcCorrection
+          );
+    }
+
+    delay(500);
+
+    int16_t startError =
+        scd41.startPeriodicMeasurement();
+
+    if (stopError == 0 &&
+        frcError == 0 &&
+        frcCorrection != 0xFFFF &&
+        startError == 0) {
+
+      scd41CalibrationOK = true;
+
+      int16_t correction =
+          (int32_t)frcCorrection - 0x8000;
+
+      Serial.println(
+        "SCD41: Kalibrierung erfolgreich"
+      );
+
+      Serial.print(
+        "SCD41 Korrekturwert: "
+      );
+
+      Serial.print(correction);
+      Serial.println(" ppm");
+
+    } else {
+
+      Serial.println(
+        "SCD41: Kalibrierung FEHLER"
+      );
+
+      Serial.print("Stop Error: ");
+      Serial.println(stopError);
+
+      Serial.print("FRC Error: ");
+      Serial.println(frcError);
+
+      Serial.print("Start Error: ");
+      Serial.println(startError);
+    }
+
+  } else {
+
+    Serial.println(
+      "SCD41: nicht verfuegbar"
+    );
+  }
+
+
+  // ==========================================================
+  // CCS811
+  // ==========================================================
+
+  Serial.println(
+    "CCS811: keine CO2-FRC"
+  );
+
+  Serial.println("================================");
+
+
+  // ==========================================================
+  // LCD ERGEBNIS
+  // ==========================================================
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("30:");
+
+  if (scd30CalibrationOK) {
+    lcd.print("OK");
+  } else {
+    lcd.print("ERR");
+  }
+
+  lcd.setCursor(8, 0);
+  lcd.print("41:");
+
+  if (scd41CalibrationOK) {
+    lcd.print("OK");
+  } else {
+    lcd.print("ERR");
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print("Kalib. beendet");
+
+  delay(3000);
+
+  lastMeasurement = millis();
+}
+
+
+// ============================================================
+// SENSOREN AUSLESEN
+// ============================================================
+
+void readSensors() {
+
+  // ==========================================================
+  // SCD41
+  // ==========================================================
+
+  if (scd41Available) {
+
+    uint16_t tempCO2 = 0;
+    float tempTemperature = 0.0;
+    float tempHumidity = 0.0;
+
+    int16_t error =
+        scd41.readMeasurement(
+          tempCO2,
+          tempTemperature,
+          tempHumidity
+        );
+
+    if (error == 0) {
+
+      // 0 bedeutet: kein gueltiger neuer Messwert
+      if (tempCO2 != 0) {
+
+        scd41_co2 = tempCO2;
+        scd41_temp = tempTemperature;
+        scd41_hum = tempHumidity;
+      }
+
+    } else {
+
+      Serial.print(
+        "SCD41 Lesefehler: "
+      );
+
+      Serial.println(error);
+    }
+  }
+
+
+  // ==========================================================
+  // SCD30
+  // ZUERST AUSLESEN, DAMIT CCS811 AKTUELLE T/H-WERTE BEKOMMT
+  // ==========================================================
+
+  if (scd30Available) {
+
+    if (scd30.dataAvailable()) {
+
+      scd30_co2 =
+          scd30.getCO2();
+
+      scd30_temp =
+          scd30.getTemperature();
+
+      scd30_hum =
+          scd30.getHumidity();
+    }
+  }
+
+
+  // ==========================================================
+  // CCS811
+  // ==========================================================
+
+  if (ccs811Available) {
+
+    // NEU:
+    // Temperatur und Luftfeuchtigkeit des SCD30
+    // zur Kompensation des CCS811 verwenden
+
+    if (scd30_hum > 0.0 &&
+        scd30_hum <= 100.0) {
+
+      ccs811.setEnvironmentalData(
+        scd30_hum,
+        scd30_temp
+      );
+    }
+
+    if (ccs811.available()) {
+
+      if (!ccs811.readData()) {
+
+        ccs_co2 =
+            ccs811.geteCO2();
+
+      } else {
+
+        Serial.println(
+          "CCS811 Lesefehler"
+        );
+      }
+    }
+  }
+}
+
+
+// ============================================================
+// LCD
+// ============================================================
+
+void updateDisplay() {
+
+  lcd.clear();
+
+
+  // ==========================================================
+  // ZEILE 1
+  // Temperatur links
+  // CCS811 rechts
+  // ==========================================================
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("T:");
+
+  if (scd30_temp != 0.0) {
+
+    lcd.print(scd30_temp, 1);
+    lcd.print("C");
+
+  } else {
+
+    lcd.print("--.-C");
+  }
+
+
+  String ccsString;
+
+  if (ccs_co2 > 0) {
+    ccsString = String(ccs_co2);
+  } else {
+    ccsString = "---";
+  }
+
+  int ccsPosition =
+      16 - (ccsString.length() + 2);
+
+  lcd.setCursor(ccsPosition, 0);
+
+  lcd.print(ccsString);
+  lcd.print(":");
+  lcd.write((uint8_t)0);
+
+
+  // ==========================================================
+  // ZEILE 2
+  // SCD41 links
+  // SCD30 rechts
+  // ==========================================================
+
+  lcd.setCursor(0, 1);
+
+  lcd.write((uint8_t)1);
+  lcd.print(":");
+
+  if (scd41_co2 > 0) {
+
+    lcd.print(scd41_co2);
+
+  } else {
+
+    lcd.print("---");
+  }
+
+
+  String scd30String;
+
+  if (scd30_co2 > 0) {
+    scd30String = String(scd30_co2);
+  } else {
+    scd30String = "---";
+  }
+
+  int scd30Position =
+      16 - (scd30String.length() + 2);
+
+  lcd.setCursor(scd30Position, 1);
+
+  lcd.print(scd30String);
+  lcd.print(":");
+  lcd.write((uint8_t)1);
+}
+
+
+// ============================================================
+// LED
+// ============================================================
+
+void updateLED() {
+
+  // SCD30 bleibt Referenzsensor
+
+  if (scd30_co2 == 0) {
+
+    digitalWrite(
+      LED_YELLOW,
+      LOW
+    );
+
+    digitalWrite(
+      LED_RED,
+      LOW
+    );
+
+  } else if (scd30_co2 < 1000) {
+
+    // Unter 1000 ppm -> GELB
+
+    digitalWrite(
+      LED_YELLOW,
+      HIGH
+    );
+
+    digitalWrite(
+      LED_RED,
+      LOW
+    );
+
+  } else {
+
+    // Ab 1000 ppm -> ROT
+
+    digitalWrite(
+      LED_YELLOW,
+      LOW
+    );
+
+    digitalWrite(
+      LED_RED,
+      HIGH
+    );
+  }
+}
+
+
+// ============================================================
+// SD-KARTE
+// ============================================================
+
+void saveToSD() {
+
+  if (!sdAvailable ||
+      !rtcAvailable) {
+
+    return;
+  }
+
+  DateTime now =
+      rtc.now();
+
+  logFile =
+      SD.open(
+        "/co2_log.csv",
+        FILE_APPEND
+      );
+
+  if (!logFile) {
+
+    Serial.println(
+      "SD Schreibfehler"
+    );
+
+    return;
+  }
+
+  logFile.printf(
+    "%02d.%02d.%04d,"
+    "%02d:%02d:%02d,"
+    "%.2f,"
+    "%d,"
+    "%d,"
+    "%d\n",
+
+    now.day(),
+    now.month(),
+    now.year(),
+
+    now.hour(),
+    now.minute(),
+    now.second(),
+
+    scd30_temp,
+
+    ccs_co2,
+    scd41_co2,
+    scd30_co2
+  );
+
+  logFile.close();
+}
+
+
+// ============================================================
+// SERIAL MONITOR
+// ============================================================
+
+void printSerial() {
+
+  if (rtcAvailable) {
+
+    DateTime now =
+        rtc.now();
+
+    Serial.printf(
+      "%02d.%02d.%04d "
+      "%02d:%02d:%02d | ",
+
+      now.day(),
+      now.month(),
+      now.year(),
+
+      now.hour(),
+      now.minute(),
+      now.second()
+    );
+  }
+
+  Serial.printf(
+    "Temp: %.2f C | "
+    "CCS811: %d | "
+    "SCD41: %d | "
+    "SCD30: %d\n",
+
+    scd30_temp,
+
+    ccs_co2,
+    scd41_co2,
+    scd30_co2
+  );
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  // Taster kontinuierlich pruefen
+  checkButton();
+
+
+  // Alle 5 Sekunden messen
+  if (millis() - lastMeasurement
+      >= measurementInterval) {
+
+    lastMeasurement =
+        millis();
+
+    readSensors();
+
+    updateDisplay();
+
+    updateLED();
+
+    printSerial();
+
+    saveToSD();
+  }
+}
